@@ -24,8 +24,8 @@ func newGoChannel() (pubsub *gochannel.GoChannel) {
 	return pubsub
 }
 
-func Publish(topic string, msg *Message) (err error) {
-	publisher := getPublisher(topic)
+func Publish(topic string, routeKey string, msg *Message) (err error) {
+	publisher := getPublisher(topic, routeKey)
 	err = publisher.Publish(topic, msg) // 发布消息
 	if err != nil {
 		err = errors.Errorf("Publish message failed: %v", msg)
@@ -38,11 +38,14 @@ var consumerPool sync.Map
 
 // 注册消费者，如果已存在则不重复创建订阅者
 
-func RegisterConsumer(consumer Consumer) (err error) {
-	if _, loaded := consumerPool.LoadOrStore(consumer.Topic, &consumer); loaded { // 已存在，则不重复创建订阅者
-		err = errors.Errorf("RegisterConsumer topic:%s already exist", consumer.Topic)
-		return err
+func RegisterConsumer(consumers ...Consumer) (err error) {
+	for _, consumers := range consumers { // 注册消费者
+		if _, loaded := consumerPool.LoadOrStore(consumers.Topic, &consumers); loaded { // 已存在，则不重复创建订阅者
+			err = errors.Errorf("RegisterConsumer topic:%s already exist", consumers.Topic)
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -61,36 +64,36 @@ func StartConsumer() (err error) {
 	return nil
 }
 
-func getPublisher(topic string) (publisher message.Publisher) {
-	value, ok := gochannelPool.Load(topic)
-	if ok {
-		publisher = value.(message.Publisher)
-		return publisher
-	}
+func pubsubKey(topic string, routeKey string) (key string) {
+	key = topic + routeKey
+	return key
+}
+
+func getPublisher(topic string, routeKey string) (publisher message.Publisher) {
+	key := pubsubKey(topic, routeKey)
 	pubsub := newGoChannel()
-	gochannelPool.Store(topic, pubsub)
-	publisher = pubsub
+	value, _ := gochannelPool.LoadOrStore(key, pubsub)
+	publisher = value.(message.Publisher)
 	return publisher
 }
 
-func getSubscriber(topic string) (subscriber message.Subscriber) {
-	value, ok := gochannelPool.Load(topic)
-	if ok {
-		subscriber = value.(message.Subscriber)
-		return subscriber
-	}
+func getSubscriber(topic string, routeKey string) (subscriber message.Subscriber) {
+	key := pubsubKey(topic, routeKey)
 	pubsub := newGoChannel()
-	gochannelPool.Store(topic, pubsub)
-	subscriber = pubsub
+	value, _ := gochannelPool.LoadOrStore(key, pubsub)
+	subscriber = value.(message.Subscriber)
 	return subscriber
 }
 
 type Consumer struct {
-	Description string                             `json:"description"`
-	Topic       string                             `json:"topic"`
-	WorkFn      func(message *Message) (err error) `json:"-"`
-	Logger      watermill.LoggerAdapter            `json:"-"` // 日志适配器，如果不设置则使用默认日志适配器
+	Description string                  `json:"description"`
+	Topic       string                  `json:"topic"`
+	RouteKey    string                  `json:"routeKey"`
+	WorkFn      WorkFn                  `json:"-"`
+	Logger      watermill.LoggerAdapter `json:"-"` // 日志适配器，如果不设置则使用默认日志适配器
 }
+
+type WorkFn func(msg *Message) error
 
 func (c Consumer) String() string {
 	b, _ := json.Marshal(c)
@@ -115,7 +118,7 @@ func (s Consumer) Consume() (err error) {
 		err = errors.Errorf("Subscriber.Consume WorkFn required, consume:%s", s.String())
 		return err
 	}
-	subscriber := getSubscriber(s.Topic)
+	subscriber := getSubscriber(s.Topic, s.RouteKey)
 	go func() {
 		msgChan, err := subscriber.Subscribe(context.Background(), s.Topic)
 		if err != nil {
@@ -150,7 +153,7 @@ type EventMessage interface {
 	ToMessage() (msg *Message, err error)
 }
 
-func MakeWorkFn[Event any](doFn func(event Event) (err error)) (fn func(msg *Message) error) {
+func MakeWorkFn[Event any](doFn func(event Event) (err error)) (fn WorkFn) {
 	return func(msg *Message) error {
 		var event Event
 		err := json.Unmarshal(msg.Payload, &event)
