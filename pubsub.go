@@ -12,7 +12,6 @@ import (
 )
 
 var gochannelPool sync.Map
-var subscriberLookPool sync.Map // 用于存储订阅者，防止重复创建
 var MessageLogger = watermill.NewStdLogger(false, false)
 
 func newGoChannel() (pubsub *gochannel.GoChannel) {
@@ -25,7 +24,44 @@ func newGoChannel() (pubsub *gochannel.GoChannel) {
 	return pubsub
 }
 
-func GetPublisher(topic string) (publisher message.Publisher) {
+func Publish(topic string, msg *Message) (err error) {
+	publisher := getPublisher(topic)
+	err = publisher.Publish(topic, msg) // 发布消息
+	if err != nil {
+		err = errors.Errorf("Publish message failed: %v", msg)
+		return err
+	}
+	return nil
+}
+
+var consumerPool sync.Map
+
+// 注册消费者，如果已存在则不重复创建订阅者
+
+func RegisterConsumer(consumer Consumer) (err error) {
+	if _, loaded := consumerPool.LoadOrStore(consumer.Topic, &consumer); loaded { // 已存在，则不重复创建订阅者
+		err = errors.Errorf("RegisterConsumer topic:%s already exist", consumer.Topic)
+		return err
+	}
+	return nil
+}
+
+// 启动消费者
+
+func StartConsumer() (err error) {
+	consumerPool.Range(func(key, value any) bool {
+		consumer := value.(*Consumer)
+		err = consumer.Consume()
+		ok := err == nil
+		return ok
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func getPublisher(topic string) (publisher message.Publisher) {
 	value, ok := gochannelPool.Load(topic)
 	if ok {
 		publisher = value.(message.Publisher)
@@ -37,7 +73,7 @@ func GetPublisher(topic string) (publisher message.Publisher) {
 	return publisher
 }
 
-func GetSubscriber(topic string) (subscriber message.Subscriber) {
+func getSubscriber(topic string) (subscriber message.Subscriber) {
 	value, ok := gochannelPool.Load(topic)
 	if ok {
 		subscriber = value.(message.Subscriber)
@@ -49,28 +85,9 @@ func GetSubscriber(topic string) (subscriber message.Subscriber) {
 	return subscriber
 }
 
-// StartSubscriberOnce 防止重复创建订阅者，例如：重复调用订阅者，会导致重复消费消息
-func StartSubscriberOnce(consumer Consumer) (err error) {
-	topic := consumer.Topic
-	if topic == "" {
-		err = errors.Errorf("StartSubscriberOnce Topic required, consumer:%s", consumer.String())
-		return err
-	}
-	_, ok := subscriberLookPool.LoadOrStore(topic, true)
-	if ok { //已经存在
-		return nil
-	}
-	err = consumer.Consume()
-	if err != nil {
-		subscriberLookPool.Delete(topic)
-	}
-	return err
-}
-
 type Consumer struct {
 	Description string                             `json:"description"`
 	Topic       string                             `json:"topic"`
-	Subscriber  message.Subscriber                 `json:"-"` //
 	WorkFn      func(message *Message) (err error) `json:"-"`
 	Logger      watermill.LoggerAdapter            `json:"-"` // 日志适配器，如果不设置则使用默认日志适配器
 }
@@ -80,7 +97,12 @@ func (c Consumer) String() string {
 	return string(b)
 }
 
+var consumerRunningMap sync.Map
+
 func (s Consumer) Consume() (err error) {
+	if _, loaded := consumerRunningMap.LoadOrStore(s.Topic, struct{}{}); loaded { // 已存在，则不重复创建订阅者
+		return nil
+	}
 	logger := s.Logger
 	if logger == nil {
 		logger = watermill.NewStdLogger(false, false)
@@ -93,12 +115,9 @@ func (s Consumer) Consume() (err error) {
 		err = errors.Errorf("Subscriber.Consume WorkFn required, consume:%s", s.String())
 		return err
 	}
-	if s.Subscriber == nil {
-		err = errors.Errorf("Subscriber.Consume Subscriber required, consume:%s", s.String())
-		return err
-	}
+	subscriber := getSubscriber(s.Topic)
 	go func() {
-		msgChan, err := s.Subscriber.Subscribe(context.Background(), s.Topic)
+		msgChan, err := subscriber.Subscribe(context.Background(), s.Topic)
 		if err != nil {
 			logger.Error("Subscriber.Consumer.Subscribe", err, nil)
 			return
